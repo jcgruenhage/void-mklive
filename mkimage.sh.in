@@ -71,6 +71,7 @@ OPTIONS
  -b <fstype>    Set /boot filesystem type (defaults to FAT)
  -B <bsize>     Set /boot filesystem size (defaults to 64MiB)
  -r <fstype>    Set / filesystem type (defaults to EXT4)
+ -e <keyfile>   Enable LUKS encryption of the / filesystem
  -s <totalsize> Set total image size (defaults to 2GB)
  -o <output>    Set image filename (guessed automatically)
  -x <num>       Use <num> threads to compress the image (dynamic if unset)
@@ -86,12 +87,13 @@ _EOF
 #      SCRIPT EXECUTION STARTS HERE
 # ########################################
 
-while getopts "b:B:o:r:s:x:h:V" opt; do
+while getopts "b:B:o:r:e:s:x:h:V" opt; do
     case $opt in
         b) BOOT_FSTYPE="$OPTARG";;
         B) BOOT_FSSIZE="$OPTARG";;
         o) FILENAME="$OPTARG";;
         r) ROOT_FSTYPE="$OPTARG";;
+        e) ENCRYPTION_KEYFILE="$OPTARG";;
         s) IMGSIZE="$OPTARG";;
         x) COMPRESSOR_THREADS="$OPTARG" ;;
         V) echo "$PROGNAME @@MKLIVE_VERSION@@"; exit 0;;
@@ -120,7 +122,10 @@ fi
 : "${ROOT_FSTYPE:=ext4}"
 
 # Verify that the required tooling is available
-readonly REQTOOLS="sfdisk partx losetup mount truncate mkfs.${BOOT_FSTYPE} mkfs.${ROOT_FSTYPE}"
+if [ -z "${ENCRYPTION_KEYFILE}" ]; then
+    REQTOOLS="cryptsetup pwgen"
+fi
+readonly REQTOOLS="${REQTOOLS} sfdisk partx losetup mount truncate mkfs.${BOOT_FSTYPE} mkfs.${ROOT_FSTYPE}"
 check_tools
 
 # Setup the platform variable.  Here we want just the name and
@@ -213,12 +218,24 @@ _EOF
             # a small amount.
             ext[34]) disable_journal="-O ^has_journal";;
         esac
-        mkfs.${ROOT_FSTYPE} "$disable_journal" "${LOOPDEV}p2" >/dev/null 2>&1
-        mount "${LOOPDEV}p2" "$ROOTFS"
+	if [ -n "${ENCRYPTION_KEYFILE}" ]; then
+            pwgen -s 64 > ${ENCRYPTION_KEYFILE}
+            cryptsetup luksFormat --batch-mode "${LOOPDEV}p2" "${ENCRYPTION_KEYFILE}"
+	    cryptsetup luksOpen --key-file "${ENCRYPTION_KEYFILE}" "${LOOPDEV}p2" "void-mklive"
+            mkfs.${ROOT_FSTYPE} "$disable_journal" "/dev/mapper/void-mklive" >/dev/null 2>&1
+            mount "/dev/mapper/void-mklive" "$ROOTFS"
+        else
+	    mkfs.${ROOT_FSTYPE} "$disable_journal" "${LOOPDEV}p2" >/dev/null 2>&1
+            mount "${LOOPDEV}p2" "$ROOTFS"
+	fi
         mkdir -p "${ROOTFS}/boot"
         mount "${LOOPDEV}p1" "${ROOTFS}/boot"
         BOOT_UUID=$(blkid -o value -s UUID "${LOOPDEV}p1")
-        ROOT_UUID=$(blkid -o value -s UUID "${LOOPDEV}p2")
+	if [ -z "${ENCRYPTION_KEYFILE}" ]; then
+            ROOT_UUID=$(cryptsetup luksUUID "${LOOPDEV}p2")
+        else
+            ROOT_UUID=$(blkid -o value -s UUID "${LOOPDEV}p2")
+	fi
         ;;
 esac
 
@@ -350,6 +367,9 @@ esac
 # empty.  If it contains stuff we bail out here since something went
 # very wrong.
 umount -R "$ROOTFS"
+if [ -n "${ENCRYPTION_KEYFILE}" ]; then
+    cryptsetup luksClose "void-mklive"
+fi
 losetup -d "$LOOPDEV"
 rmdir "$ROOTFS" || die "$ROOTFS not empty!"
 
